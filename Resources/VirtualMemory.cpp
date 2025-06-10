@@ -1,59 +1,15 @@
-//
+////
 // Created by idodo on 04/06/2025.
 //
 
-#include "MemoryConstants.h"
 #include "PhysicalMemory.h"
+
 uint64_t get_index_at_level(uint64_t virtualAddress, int level)
 {
     uint64_t mask = (1ULL << OFFSET_WIDTH) - 1;
     int shift = OFFSET_WIDTH * (TABLES_DEPTH - 1 - level);
     return (virtualAddress >> shift) & mask;
 }
-
-void DFS(uint64_t frame,
-         int    depth,
-         uint64_t curr_parent_frame,
-         uint64_t curr_parent_index,
-         uint64_t& best_empty_frame,
-         uint64_t& best_parent_frame,
-         uint64_t& best_parent_index,
-         uint64_t& max_referenced_frame)
-{
-    bool empty_table = true;
-    for (uint64_t i = 0; i < PAGE_SIZE; i++)
-    {
-        uint64_t addr = frame * PAGE_SIZE + i;
-        word_t child_frame;
-        PMread(addr, &child_frame);
-        if (child_frame != 0)
-        {
-            empty_table = false;
-            if (child_frame > max_referenced_frame)
-            {
-                max_referenced_frame = child_frame;
-            }
-            if (depth + 1 < TABLES_DEPTH)
-            {
-                DFS(child_frame,
-                    depth + 1,             // next depth
-                    frame,                 // this frame is the parent
-                    i,                     // this slot is the index
-                    best_empty_frame,
-                    best_parent_frame,
-                    best_parent_index,
-                    max_referenced_frame);
-            }
-        }
-    }
-    if (empty_table && best_empty_frame == -1 && frame != 0)
-    {
-        best_empty_frame = frame;
-        best_parent_frame   = curr_parent_frame;
-        best_parent_index   = curr_parent_index;
-    }
-}
-
 uint64_t distance(uint64_t p1, uint64_t p2)
 {
     uint64_t TOTAL_PAGES = 1ULL << (VIRTUAL_ADDRESS_WIDTH - OFFSET_WIDTH);
@@ -64,122 +20,103 @@ uint64_t distance(uint64_t p1, uint64_t p2)
     return TOTAL_PAGES - diff;
 }
 
-// add two out‐params: &victim_parent_frame and &victim_parent_index
-void find_page_to_evict(uint64_t frame,
-                        int     depth,
-                        uint64_t page_num_prefix,
-                        uint64_t& best_distance,
-                        uint64_t& victim_frame,
-                        uint64_t& victim_page_num,
-                        uint64_t load_page_num,
-                        bool&    first_leaf,
-        // NEW:
-                        uint64_t& victim_parent_frame,
-                        uint64_t& victim_parent_index)
+uint64_t DFS(uint64_t called_page,uint64_t prev_frame,uint64_t frame,
+             int    depth,uint64_t curr_parent_frame,uint64_t curr_path,
+             uint64_t& best_parent_frame,uint64_t& best_parent_index,
+             uint64_t& max_referenced_frame,uint64_t& max_distance,
+             uint64_t& max_distance_page)
 {
-    for (int i = 0; i < PAGE_SIZE; i++)
+    if (frame > max_referenced_frame){
+        max_referenced_frame = frame;
+    }
+    if (depth == TABLES_DEPTH) {
+        uint64_t dist = distance(called_page, curr_path);
+        if (dist > max_distance) {
+            max_distance = dist;
+            max_distance_page = curr_path;
+        }
+        return -1;
+    }
+    bool empty_table = true;
+    uint64_t res = -1;
+    for (uint64_t i = 0; i < PAGE_SIZE; i++)
     {
-        word_t child;
-        PMread(frame*PAGE_SIZE + i, &child);
-        if (child != 0)
+        uint64_t addr = frame * PAGE_SIZE + i;
+        word_t child_frame;
+        PMread(addr, &child_frame);
+        if (child_frame != 0)
         {
-            uint64_t next_prefix = (page_num_prefix << OFFSET_WIDTH) | i;
-            if (depth + 1 < TABLES_DEPTH)
+            empty_table = false;
+            uint64_t next_path = curr_path*PAGE_SIZE+i;
+            uint64_t temp=DFS(called_page,prev_frame,child_frame,
+                              depth + 1,frame,
+                              next_path,best_parent_frame,
+                              best_parent_index,max_referenced_frame,
+                              max_distance,max_distance_page);
+            if(temp !=(uint64_t)-1)
             {
-                find_page_to_evict(child,
-                                   depth+1,
-                                   next_prefix,
-                                   best_distance,
-                                   victim_frame,
-                                   victim_page_num,
-                                   load_page_num,
-                                   first_leaf,
-                                   victim_parent_frame,
-                                   victim_parent_index);
-            }
-            else
-            {
-                uint64_t dist = distance(next_prefix, load_page_num);
-                if (first_leaf || dist > best_distance) {
-                    best_distance           = dist;
-                    victim_frame            = child;
-                    victim_page_num         = next_prefix;
-                    first_leaf              = false;
-                    // record who pointed at it:
-                    victim_parent_frame     = frame;
-                    victim_parent_index     = i;
-                }
+                res = temp;
             }
         }
     }
+    if (empty_table && frame != prev_frame)
+    {
+        best_parent_frame   = curr_parent_frame;
+        best_parent_index   = curr_path%PAGE_SIZE;
+        return frame;
+    }
+    return res;
 }
 
 
-uint64_t evict_and_return_frame(uint64_t virtualAddress)
+uint64_t evict_and_return_frame(uint64_t page_to_evict)
 {
-    uint64_t load_page_num        = virtualAddress >> OFFSET_WIDTH;
-    uint64_t best_distance        = 0;
-    bool     first_leaf           = true;
-    uint64_t victim_frame         = (uint64_t)-1;
-    uint64_t victim_page_num      = 0;
-    // NEW helpers for parent info:
-    uint64_t victim_parent_frame  = 0;
-    uint64_t victim_parent_index  = 0;
+    const uint64_t mask = PAGE_SIZE - 1;
+    uint64_t offset = page_to_evict & mask;
+    word_t curr_frame   = 0;
+    uint64_t parent_slot  = 0;
 
-    find_page_to_evict(0,
-                       0,
-                       0,
-                       best_distance,
-                       victim_frame,
-                       victim_page_num,
-                       load_page_num,
-                       first_leaf,
-                       victim_parent_frame,
-                       victim_parent_index);
-
-    // 1) Evict the leaf
-    PMevict(victim_frame, victim_page_num);
-
-    // 2) Unlink that exact pointer
-    PMwrite(victim_parent_frame * PAGE_SIZE + victim_parent_index, 0);
-
-    // 3) Done
-    return victim_frame;
+    for (int lvl = 0; lvl < TABLES_DEPTH; lvl++) {
+        uint64_t slot = get_index_at_level(page_to_evict, lvl);
+        parent_slot = curr_frame;
+        PMread(curr_frame*PAGE_SIZE + slot, &curr_frame);
+    }
+    PMevict(curr_frame, page_to_evict);
+    PMwrite(parent_slot*PAGE_SIZE + offset, 0);
+    return curr_frame;
 }
 
 
 uint64_t get_new_frame(uint64_t virtualAddress, uint64_t parent_frame)
 {
-    uint64_t best_parent_frame = 0;
-    uint64_t best_parent_index = 0;
-    uint64_t best_empty_frame = -1;
+    uint64_t best_parent_frame = -1;
+    uint64_t best_parent_index = -1;
     uint64_t max_referenced_frame = 0;
-
-// initial call:
-    DFS(0,          // frame = root
-        0,          // depth = 0
-        0,          // curr_parent_frame = unused for root
-        0,          // curr_parent_index = unused for root
-        best_empty_frame,
-        best_parent_frame,
-        best_parent_index,
-        max_referenced_frame);
-    if (best_empty_frame != -1 && best_empty_frame != parent_frame)
+    uint64_t max_distance = 0;
+    uint64_t max_distance_page = -1;
+    uint64_t called_page = virtualAddress >> OFFSET_WIDTH;
+    uint64_t returned_frame = DFS(called_page,parent_frame,0,
+                                  0,0,0,
+                                  best_parent_frame,best_parent_index,
+                                  max_referenced_frame,max_distance,
+                                  max_distance_page);
+    if (returned_frame !=(uint64_t) -1 )
     {
         PMwrite(best_parent_frame * PAGE_SIZE + best_parent_index, 0);
-        return best_empty_frame;
+        return returned_frame;
     }
     if (max_referenced_frame + 1 < NUM_FRAMES)
     {
         return max_referenced_frame + 1;
     }
-    return evict_and_return_frame(virtualAddress);
+    return evict_and_return_frame(max_distance_page);
 }
 
 uint64_t get_physical_address(uint64_t virtualAddress)
 {
     uint64_t frame = 0;
     uint64_t page_number = virtualAddress >> OFFSET_WIDTH;
+
     for (int level = 0; level < TABLES_DEPTH; level++)
     {
         uint64_t idx = get_index_at_level(page_number, level);
